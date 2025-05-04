@@ -3,7 +3,8 @@ import os
 import json
 import base64
 import datetime
-from flask import Flask, request
+import threading
+from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 def init_google_sheet():
     encoded = os.getenv("CREDENTIALS_JSON_BASE64")
     credentials_data = base64.b64decode(encoded).decode("utf-8")
-    creds = Credentials.from_service_account_info(json.loads(credentials_data))
+    creds = Credentials.from_service_account_info(json.loads(credentials_data), scopes=["https://www.googleapis.com/auth/spreadsheets"])
     gc = gspread.authorize(creds)
     spreadsheet_id = os.getenv("SPREADSHEET_ID")
     return gc.open_by_key(spreadsheet_id)
@@ -84,7 +85,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not info.get("Квартира"):
         import re
-        match = re.search(r"кв(?:артир[а-я]*)?\s*(\d{1,4})", text.lower())
+        match = re.search(r"\bкв(?:артир[а-я]*)?\s*(\d{1,4})", text.lower())
         if match:
             apartment_number = match.group(1)
             sheet_apartment.update_cell(row_index, 3, apartment_number)
@@ -107,7 +108,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Будь ласка, введи лише ціле число — поточний показник лічильника.")
 
-async def send_reminders(app):
+# === НАГАДУВАННЯ ===
+async def send_reminders(app: Application):
     today = datetime.date.today()
     day = today.day
     if day == 21:
@@ -143,25 +145,31 @@ async def send_reminders(app):
             except Exception as e:
                 logger.warning(f"Не вдалося надіслати нагадування: {e}")
 
+# === FLASK СЕРВЕР ===
 app = Flask(__name__)
 
-@app.route("/")
+@app.route('/')
 def index():
-    return "Bot is running."
+    return 'Бот працює!'
 
-@app.route("/start-bot")
-def start_bot():
+# === ЗАПУСК БОТА ===
+def run_bot():
+    async def main():
+        bot_app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
+        bot_app.add_handler(CommandHandler("start", start))
+        bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+        scheduler = BackgroundScheduler()
+        scheduler.add_job(lambda: bot_app.create_task(send_reminders(bot_app)), "cron", hour=10, minute=0)
+        scheduler.start()
+
+        logger.info("Бот запущено")
+        await bot_app.run_polling()
+
     import asyncio
-    asyncio.create_task(main())
-    return "Bot started."
+    asyncio.run(main())
 
-async def main():
-    from telegram.ext import Application
-    application = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(lambda: application.create_task(send_reminders(application)), "cron", hour=10, minute=0)
-    scheduler.start()
-    logger.info("Бот запущено")
-    await application.run_polling()
+threading.Thread(target=run_bot).start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
